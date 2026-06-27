@@ -1,7 +1,8 @@
 "use strict";
 
 // ===== AES-256-ECB decrypt (pure JS) =====
-// ถอดรหัสเนื้อหาที่ Jinovel เข้ารหัสไว้ (ตรวจสอบแล้วตรงกับ FIPS-197 C.3 และ node crypto)
+// Decrypts Jinovel's encrypted chapter content.
+// Verified against FIPS-197 C.3 test vector and byte-exact vs node crypto.
 const JinovelAes = (() => {
     const mul = (a, b) => {
         let r = 0;
@@ -62,7 +63,7 @@ const JinovelAes = (() => {
         invShiftRows(st); invSubBytes(st); addRoundKey(st, w, 0);
         return st;
     }
-    // ถอดรหัส AES-256-ECB ทั้ง buffer (ยังไม่ตัด padding ออก)
+    // Decrypt an AES-256-ECB buffer (padding NOT removed).
     function decryptECB(key, cipher) {
         const w = keyExpansion(key), out = [];
         for (let i = 0; i < cipher.length; i += 16) {
@@ -79,12 +80,10 @@ class JinovelParser extends Parser {
         super();
     }
 
-    // [แก้ปัญหาที่ 2] บังคับให้เป็นภาษาไทย
     extractLanguage(dom) {
         return "th";
     }
 
-    // [แก้ปัญหาที่ 1] ดึงชื่อผู้แต่ง
     extractAuthor(dom) {
         let author = dom.querySelector('.text-yellow-600');
         if (author) {
@@ -93,7 +92,7 @@ class JinovelParser extends Parser {
         return "Jinovel";
     }
 
-    // [แก้ปัญหาที่ 3 และ 4] ดึงหน้าปก และแก้บั๊กค้าง (Cloudflare)
+    // Cover image: unwrap the S3 url hidden behind a Cloudflare proxy path.
     findCoverImageUrl(dom) {
         let metaImg = dom.querySelector('meta[property="og:image"]');
         if (metaImg) {
@@ -107,7 +106,7 @@ class JinovelParser extends Parser {
         return super.findCoverImageUrl(dom);
     }
 
-    // สารบัญแบบ API
+    // Table of contents via API.
     async getChapterUrls(dom) {
         let chapterUrls = [];
         let match = dom.baseURI.match(/\/novel\/([a-f0-9-]+)/i);
@@ -127,7 +126,7 @@ class JinovelParser extends Parser {
                 if (Array.isArray(items) && items.length > 0) {
                     for (let chapter of items) {
                         if (chapter.id) {
-                            let title = chapter.name || chapter.title || ("ตอนที่ " + chapter.id);
+                            let title = chapter.name || chapter.title || ("Chapter " + chapter.id);
                             chapterUrls.push({
                                 sourceUrl: `https://www.jinovel.com/novel/chapter/${chapter.id}`,
                                 title: title.trim()
@@ -147,8 +146,8 @@ class JinovelParser extends Parser {
         return chapterUrls;
     }
 
-    // วิธี B (หลัก): ดึงผ่าน API + ถอดรหัส AES เอง — เร็วกว่า + ไม่ต้องเปิด tab + batch ได้
-    // วิธี A (fallback): render ใน tab จริง (กรณี API ไม่ได้ เช่น ติดเหรียญ/เข้าระบบ)
+    // Method B (primary): fetch via API + AES decrypt — faster, no tab hijack, batchable.
+    // Method A (fallback): render in a real tab (used when API fails, e.g. login/coin-gated).
     async fetchChapter(url) {
         let tabId = JinovelParser.extractTabIdFromQueryParameter();
         let m = url.match(/\/novel\/chapter\/([a-f0-9-]+)/i);
@@ -156,7 +155,7 @@ class JinovelParser extends Parser {
             try {
                 return await this.fetchChapterViaApi(m[1], tabId);
             } catch (e) {
-                console.warn("[Jinovel] วิธี B (API) ล้มเหลว ใช้วิธี A (render-in-tab):", e.message);
+                console.warn("[Jinovel] Method B (API) failed, falling back to method A (render-in-tab):", e.message);
             }
         }
         if (tabId != null && !util.isFirefox()) {
@@ -165,21 +164,16 @@ class JinovelParser extends Parser {
         return (await HttpClient.wrapFetch(url)).responseXML;
     }
 
-    // === วิธี B: API + decrypt (hybrid: รองรับตอนฟรี + ตอนเสียเงิน) ===
+    // === Method B: API + decrypt (hybrid: free + paid chapters) ===
     // API: GET /v1/l/chapters/{id}/content -> {data:{content(base64), temporaryKey}}
-    //   - ตอนฟรี (anonymous): key = temporaryKey
-    //   - ตอนเสียเงิน (login): เซิร์ฟเวอร์เข้ารหัสด้วย userId + ต้องส่ง Authorization: Bearer
-    //     accessToken/userId อ่านจาก cookie "jinovel" (vuex-persistedstate auth module)
-    // key = sha256(keyStr) hex ตัดเอา 32 ตัวหลัง -> ASCII 32 bytes = AES-256 key
-    // AES-ECB ถอด base64(content) -> HTML ไทยสะอาด (ข้าม encContent ที่สร้าง tofu)
+    //   - free chapter (anonymous): key = temporaryKey
+    //   - paid chapter (logged in): server encrypts with userId + requires Authorization: Bearer
+    //     accessToken/userId are read from the jinovel tab localStorage / cookie
+    // key = sha256(keyStr) last 32 hex chars -> ASCII 32 bytes = AES-256 key
+    // AES-ECB decrypt base64(content) -> clean Thai HTML (skip encContent which creates tofu)
     async fetchChapterViaApi(chapterId, tabId) {
-        let t0 = Date.now();
-        let step = (label) => console.log("[Jinovel] +" + (Date.now() - t0) + "ms  " + label);
-        step("API method (วิธี B)  chapterId=" + chapterId);
-
-        // อ่าน auth จาก localStorage ของ tab jinovel (ก่อน) หรือ cookie (รอง) — ถ้า login อยู่
+        // Read auth from the jinovel tab localStorage (primary) or cookie (fallback) if logged in.
         let auth = await JinovelParser.getAuth(tabId);
-        step("auth: " + (auth ? "logged-in  userId=" + auth.userId : "anonymous (ตอนฟรีเท่านั้น)"));
 
         let apiUrl = "https://api.jinovel.com/v1/l/chapters/" + chapterId + "/content";
         let fetchOpts = { credentials: "include" };
@@ -190,35 +184,23 @@ class JinovelParser extends Parser {
         let data = json?.data || json || {};
         let content = data.content;
         let temporaryKey = data.temporaryKey;
-        step("API raw: success=" + json?.success + "  keys=[" + Object.keys(data).join(",") + "]"
-            + "  content=" + (content ? content.length + "B" : "null")
-            + "  temporaryKey=" + (temporaryKey ? "yes" : "no"));
         if (!content) {
-            throw Error("ไม่ได้รับเนื้อหา (ต้อง login/เป็นเจ้าของตอน?) → ลองวิธี A");
+            throw Error("No content received (login required / not owner?)");
         }
 
-        // ลอง key: userId ก่อน (ตอนเสียเงิน) แล้วถึง temporaryKey (ตอนฟรี)
+        // Try keys: userId first (paid), then temporaryKey (free).
         let html = null;
-        let usedKey = null;
         if (auth?.userId) {
-            try {
-                html = await JinovelParser.decryptContent(content, auth.userId);
-                usedKey = "userId";
-            } catch (e) { html = null; }
+            try { html = await JinovelParser.decryptContent(content, auth.userId); } catch (e) { html = null; }
         }
         if (!JinovelParser.htmlLooksValid(html) && temporaryKey) {
             html = await JinovelParser.decryptContent(content, temporaryKey);
-            usedKey = "temporaryKey";
         }
-        let valid = JinovelParser.htmlLooksValid(html);
-        step("decrypt usedKey=" + usedKey + "  valid(<p>)=" + valid
-            + "  html=" + (html ? html.length : 0) + " chars"
-            + "  preview=" + JSON.stringify(html ? html.slice(0, 80) : ""));
-        if (!valid) {
-            throw Error("ถอดรหัสไม่สำเร็จ → ลองวิธี A");
+        if (!JinovelParser.htmlLooksValid(html)) {
+            throw Error("Decryption failed");
         }
 
-        // ชื่อตอน (ลองดึง metadata, ถ้า fail ก็ช่างมัน)
+        // Chapter title (best-effort metadata fetch).
         let title = "Chapter";
         try {
             let meta = (await HttpClient.fetchJson("https://api.jinovel.com/v1/l/chapters/" + chapterId)).json;
@@ -234,16 +216,14 @@ class JinovelParser extends Parser {
         wrap.className = "jinovel-content";
         wrap.innerHTML = html;
         dom.body.appendChild(wrap);
-        step("API method END  total=" + (Date.now() - t0) + "ms");
         return dom;
     }
 
-    // อ่าน accessToken + userId เพื่อ decrypt ตอนเสียเงิน
-    // ลำดับ: (1) localStorage "jinovel" ของ tab jinovel (vuex-persistedstate เก็บที่นี่) -> (2) cookie "jinovel"
+    // Read accessToken + userId for decrypting paid chapters.
+    // Order: (1) "jinovel" localStorage of the jinovel tab (vuex-persistedstate) -> (2) "jinovel" cookie
     static async getAuth(tabId) {
         let raw = null;
-        let source = null;
-        // (1) localStorage ของ tab jinovel
+        // (1) localStorage of the jinovel tab
         if (tabId != null && !util.isFirefox()) {
             try {
                 let rs = await chrome.scripting.executeScript({
@@ -251,18 +231,17 @@ class JinovelParser extends Parser {
                     func: () => { try { return localStorage.getItem("jinovel"); } catch (e) { return null; } }
                 });
                 let v = rs?.[0]?.result;
-                if (v) { raw = v; source = "localStorage(tab)"; }
+                if (v) { raw = v; }
             } catch (e) { /* ignore */ }
         }
         // (2) cookie
         if (!raw && chrome?.cookies?.get) {
             try {
                 let c = await chrome.cookies.get({ url: "https://www.jinovel.com", name: "jinovel" });
-                if (c?.value) { raw = c.value; source = "cookie"; }
+                if (c?.value) { raw = c.value; }
             } catch (e) { /* ignore */ }
         }
         if (!raw) {
-            console.log("[Jinovel] auth: ไม่พบข้อมูล auth (ไม่เจอ localStorage และ cookie 'jinovel')");
             return null;
         }
         let obj = null;
@@ -270,7 +249,6 @@ class JinovelParser extends Parser {
             try { obj = JSON.parse(v); if (obj) break; } catch (e) { /* try next */ }
         }
         if (!obj) {
-            console.log("[Jinovel] auth: พบข้อมูล (" + source + ") แต่ parse JSON ไม่ได้");
             return null;
         }
         let auth = obj?.auth || obj?.state?.auth || {};
@@ -279,13 +257,6 @@ class JinovelParser extends Parser {
             || profile.core?.id || profile.library?.id
             || profile.core?._id || profile.library?._id;
         let accessToken = auth.accessToken || auth.token;
-        // log โครงสร้างเพื่อวินิจฉัย ถ้า field ไม่ตรงจะได้เห็น
-        console.log("[Jinovel] auth source=" + source
-            + "  topKeys=[" + Object.keys(obj).join(",") + "]"
-            + "  authKeys=[" + Object.keys(auth).join(",") + "]"
-            + "  profileKeys=[" + Object.keys(profile).join(",") + "]"
-            + "  userId=" + (userId ? "found" : "MISSING")
-            + "  accessToken=" + (accessToken ? "found" : "MISSING"));
         if (accessToken && userId) {
             return { accessToken, userId };
         }
@@ -296,14 +267,14 @@ class JinovelParser extends Parser {
         return typeof html === "string" && html.length > 20 && /<p[\s>]/i.test(html);
     }
 
-    static async decryptContent(contentBase64, temporaryKey) {
-        let hashHex = await JinovelParser.sha256Hex(temporaryKey);
-        let keyHex = hashHex.slice(32); // 32 ตัวหลังของ hex sha256
-        let keyBytes = new TextEncoder().encode(keyHex); // 32 bytes ASCII
+    static async decryptContent(contentBase64, keyStr) {
+        let hashHex = await JinovelParser.sha256Hex(keyStr);
+        let keyHex = hashHex.slice(32); // last 32 hex chars of sha256
+        let keyBytes = new TextEncoder().encode(keyHex); // 32 ASCII bytes
         let ctBytes = JinovelParser.base64ToBytes(contentBase64);
         let ptBytes = JinovelAes.decryptECB(keyBytes, ctBytes);
         let text = new TextDecoder("utf-8").decode(ptBytes);
-        // ตัด control char 0x01-0x10 (PKCS7 padding ที่ aes-js ทิ้งไว้) + trim
+        // Strip control chars 0x01-0x10 (PKCS7 padding leftover from aes-js) + trim.
         text = text.replace(/[\u0001-\u0010]/g, "");
         return text.trim();
     }
@@ -322,24 +293,18 @@ class JinovelParser extends Parser {
         return bytes;
     }
 
-    // === วิธี A (fallback): render ใน tab จริง ===
+    // === Method A (fallback): render in a real tab ===
     static extractTabIdFromQueryParameter() {
         let tabId = new URLSearchParams(window.location.search).get("id");
         return util.isNullOrEmpty(tabId) ? null : parseInt(tabId, 10);
     }
 
     async fetchChapterInTab(tabId, url) {
-        let t0 = Date.now();
-        let step = (label) => console.log("[Jinovel] +" + (Date.now() - t0) + "ms  " + label);
-        step("fetchChapterInTab (fallback) START  url=" + url);
-
-        step("→ chrome.tabs.update");
         await chrome.tabs.update(tabId, { url: url });
-        step("← tabs.update returned");
 
         let expectedPath = new URL(url).pathname;
 
-        step("→ poll content");
+        // Poll content directly (do not rely on tabs.onUpdated — unreliable for SPAs).
         let pollStart = Date.now();
         let data = null;
         let MAX_POLLS = 100;
@@ -360,48 +325,29 @@ class JinovelParser extends Parser {
                                 : (document.title || "");
                             return {
                                 ok: true, html: contentDiv.outerHTML, title: title,
-                                selector: "div.text-grey-800.bg-yellow-300",
                                 textLen: cleanLen(contentDiv), onTarget: onTarget,
                             };
                         }
                         let body = document.body?.innerText || "";
-                        if (onTarget && (body.includes("เข้าสู่ระบบ") || body.includes("ล็อกอิน"))) {
-                            return { ok: false, error: "login-required", onTarget: onTarget };
-                        }
-                        return {
-                            ok: false, onTarget: onTarget,
-                            path: location.pathname, bodyLen: body.length,
-                            readyState: document.readyState,
-                            bg300: document.querySelectorAll("div.bg-yellow-300").length,
-                        };
+                        return { ok: false, onTarget: onTarget };
                     },
                 });
                 result = rs?.[0]?.result;
             } catch (e) {
-                result = { ok: false, error: "exec:" + e.message };
+                result = { ok: false };
             }
 
             if (result?.ok) {
                 data = result;
-                step("← content found at poll #" + (i + 1) + " (" + (Date.now() - pollStart) + "ms)"
-                    + "  textLen=" + data.textLen);
                 break;
-            }
-            if (i === 0 || (i + 1) % 5 === 0) {
-                step("  poll #" + (i + 1) + ": " + JSON.stringify(result));
-            }
-            if (result?.error === "login-required") {
-                throw Error("Jinovel: ต้องเข้าสู่ระบบก่อน");
             }
             await util.sleep(300);
         }
 
         if (!data || !data.ok) {
-            step("✗ no content after " + MAX_POLLS + " polls (" + (Date.now() - pollStart) + "ms)");
-            throw Error("Jinovel: ไม่เจอเนื้อหาหลังรอ " + Math.round((Date.now() - pollStart) / 1000) + "s");
+            throw Error("Jinovel: content not found after " + Math.round((Date.now() - pollStart) / 1000) + "s");
         }
 
-        step("→ ประกอบ DOM");
         let dom = new DOMParser().parseFromString(
             "<html><head></head><body></body></html>", "text/html");
         let h1 = dom.createElement("h1");
@@ -411,7 +357,6 @@ class JinovelParser extends Parser {
         wrap.className = "jinovel-content";
         wrap.innerHTML = data.html;
         dom.body.appendChild(wrap);
-        step("fetchChapterInTab END  total=" + (Date.now() - t0) + "ms");
         return dom;
     }
 
@@ -425,8 +370,8 @@ class JinovelParser extends Parser {
         return h1 ? h1.textContent.trim() : "Chapter";
     }
 
-    // เนื้อหาที่ได้จากทั้งสองวิธีห่อไว้ใน div.jinovel-content
-    // วิธี B: ได้ HTML ไทยสะอาดอยู่แล้ว วิธี A: มี span csprajad ต้อง remap
+    // Both methods wrap content in div.jinovel-content.
+    // Method B yields clean Thai HTML; method A has csprajad spans that need remapping.
     findContent(dom) {
         let content = dom.querySelector(".jinovel-content")
             || dom.querySelector("div.text-grey-800.bg-yellow-300")
@@ -435,16 +380,17 @@ class JinovelParser extends Parser {
             || dom.querySelector(".content");
         if (!content) {
             let err = dom.createElement("div");
-            err.innerHTML = "<p>Jinovel: ไม่พบเนื้อหา (อาจเป็นตอนที่ต้องเข้าสู่ระบบ/ติดเหรียญ)</p>";
+            err.innerHTML = "<p>Jinovel: content not found (chapter may require login / coin-gated)</p>";
             return err;
         }
-        // แก้ฟอนต์ CSPraJad (กรณีวิธี A) — วิธี B ไม่มี span นี้จึงเป็น no-op
+        // Fix CSPraJad font (method A case); no-op for method B (no such spans).
         JinovelParser.fixCspPrajad(content);
         content.querySelectorAll("p:empty").forEach(p => p.remove());
         return content;
     }
 
-    // เว็บใช้ฟอนต์ CSPraJad1/2 เก็บพยัญชนะไทยใน codepoint สงวน (U+0E5C–U+0E7F)
+    // The site uses CSPraJad1/2 fonts storing Thai consonants in reserved Thai-block
+    // codepoints (U+0E5C-U+0E7F) as anti-scrape -> shows as tofu in normal readers.
     static CSPRAJAD1_MAP = {
         "\u0e5c": "\u0e12", "\u0e5d": "\u0e16", "\u0e5e": "\u0e19", "\u0e5f": "\u0e13",
         "\u0e60": "\u0e02", "\u0e61": "\u0e17", "\u0e62": "\u0e1a", "\u0e63": "\u0e21",
